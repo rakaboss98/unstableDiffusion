@@ -78,7 +78,7 @@ class DownBlock(nn.Module):
         # Add the original input (after processing through a convolutional layer if down-sampling is enabled) to the output
         # This forms a residual connection, which helps in training deeper networks by allowing gradients to flow more easily
         out = out + self.residul_input_conv(resnet_input)
-        print(out.shape)
+        
         # Attention block
 
         # Get the shape of the current output to use in reshaping for the attention mechanism
@@ -188,49 +188,58 @@ class MidBlock(nn.Module):
         return out
 
 class UpBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, t_emb_dim, up_sample, num_heads):
+    def __init__(self, down_channels, in_channels, out_channels, t_emb_dim, up_sample, num_heads):
         super().__init__()
         self.up_sample = up_sample
+
         self.resnet_conv_first = nn.Sequential(
-            nn.GroupNorm(num_groups=1, out_channels=in_channels),
+            nn.GroupNorm(num_groups=1, num_channels=down_channels+in_channels),
             nn.SiLU(),
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1)
+            nn.Conv2d(down_channels+in_channels, out_channels, kernel_size=3, stride=1, padding=1)
         )
+
         self.t_emb_layers = nn.Sequential(
             nn.SiLU(),
             nn.Linear(t_emb_dim, out_channels)
         )
+
         self.resnet_conv_second = nn.Sequential(
-            nn.GroupNorm(num_groups=1, out_channels=out_channels),
+            nn.GroupNorm(num_groups=1, num_channels=out_channels),
             nn.SiLU(),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
         )
-        self.attention_norm = nn.GroupNorm(num_groups=1, out_channels=out_channels)
-        self.attention = nn.MultiheadAttention(out_channels, num_heads, batch_first=True)
-        self.residual_input_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-        self.up_sample_conv = nn.ConvTranspose2d(in_channels//2, in_channels//2, kernel_size=4,
+
+        self.attention_norm = nn.GroupNorm(num_groups=1, num_channels=out_channels)
+        self.attention = nn.MultiheadAttention(embed_dim=out_channels, num_heads=num_heads, batch_first=True)
+        self.residual_input_conv = nn.Conv2d(down_channels+in_channels, out_channels, kernel_size=1)
+
+        # Convolutional layer for up-sampling, if enabled; otherwise, an identity mapping
+        self.up_sample_conv = nn.ConvTranspose2d(in_channels, in_channels, kernel_size=4,
                                                  stride=2, padding=1) if self.up_sample else nn.Identity()
     
     def forward(self, x, out_down, t_emb):
+        # Apply up-sampling to the input tensor if enabled
         x = self.up_sample_conv(x)
+
+        # Concatenate the up-sampled tensor with the output from a corresponding down-sampling block
         x = torch.cat(tensors=[x, out_down], dim=1)
 
-        # Resnet block
-        out = x
-        resnet_input = out
-        out = self.resnet_conv_first(out)
+        # ResNet block processing
+        resnet_input = x
+        out = self.resnet_conv_first(x)
         out = out + self.t_emb_layers(t_emb)[:, :, None, None]
         out = self.resnet_conv_second(out)
         out = out + self.residual_input_conv(resnet_input)
 
-        # Attention block
+        # Attention block processing
         batch_size, channels, h, w = out.shape
-        in_attn = self.attention_norm(in_attn)
+        in_attn = self.attention_norm(out)
         in_attn = out.reshape(batch_size, channels, h*w)
-        in_attn = in_attn.tranpose(1, 2)
+        in_attn = in_attn.transpose(1, 2)
         out_attn, _ = self.attention(in_attn, in_attn, in_attn)
         out_attn = out_attn.transpose(1, 2).reshape(batch_size, channels, h, w)
-        out = out+out_attn
+
+        out = out + out_attn
         
         return out
 
@@ -258,11 +267,16 @@ class TestTimeEmbedding(unittest.TestCase):
 
 def viz_downlock():
 
-    model = DownBlock(in_channels=3, out_channels=16, num_heads=4, t_emb_dim=32, down_sample='no')
+    model = DownBlock(in_channels=3, out_channels=16, num_heads=4, t_emb_dim=32, down_sample=1)
 
     # Create dummy tensors
     x = torch.randn(1, 3, 64, 64) # Example input tensor
     t_emb = torch.randn(1, 32) # Example time embedding tensor
+
+    print("---input size---", x.shape)
+
+    out = model.forward(x, t_emb)
+    print("---downblock output---", out.shape)
 
     # Generate the visual graph
     model_graph = draw_graph(model, input_data=(x, t_emb))
@@ -272,11 +286,14 @@ def viz_downlock():
 
 def viz_midblock():
 
-    model = MidBlock(in_channels=3, out_channels=16, t_emb_dim=32, num_heads=4)
+    model = MidBlock(in_channels=16, out_channels=32, t_emb_dim=32, num_heads=4)
 
     # Create dummy input tensors
-    x = torch.randn(1, 3, 64, 64)  # Example input tensor
+    x = torch.randn(1, 16, 32, 32)  # Example input tensor
     t_emb = torch.randn(1, 32)  # Example time embedding tensor
+
+    out = model.forward(x, t_emb)
+    print("---midblock output---", out.shape)
 
     # Generate the visual graph
     model_graph = draw_graph(model, input_data=(x, t_emb))
@@ -284,9 +301,28 @@ def viz_midblock():
     # Visualize the graph
     model_graph.visual_graph.render('midblock_architecture', format='png')
 
+def viz_upblock():
+
+    # Create dummy input tensors
+    x = torch.randn(1, 32, 32, 32)  # Example input tensor
+    out_down = torch.randn(1, 16, 64, 64) # the output of the downsampled block
+    t_emb = torch.randn(1, 32)  # Example time embedding tensor
+
+    model = UpBlock(in_channels= 32, down_channels=out_down.size(1), out_channels=3, t_emb_dim=32, num_heads=3, up_sample=1)
+
+    out = model.forward(x, out_down, t_emb)
+    print('---out of up block---', out.shape)
+
+    # Generate the visual graph
+    model_graph = draw_graph(model, input_data=(x, out_down, t_emb))
+
+    #Visualize the data
+    model_graph.visual_graph.render('upblock_architecture', format='png')
+
 # Run the unit tests
 if __name__ == '__main__':
     # Call the function to create and save the computational graph
     viz_downlock()
     viz_midblock()
+    viz_upblock()
     unittest.main()
